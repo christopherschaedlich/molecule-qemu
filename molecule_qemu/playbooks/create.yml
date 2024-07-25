@@ -53,8 +53,9 @@
 
             "network_extra_args": "{{ item.network_extra_args | default(qemu_network_extra_args) }}",
             "network_mode": "{{ item.network_mode | default(qemu_network_mode) }}",
-            "network_mac": "{{ '52:54:00' | community.general.random_mac() | regex_replace('(^|:)0([0-9A-Fa-f])', '\\1\\2') }}",
-
+            "network_mac": "{{ item.network_ip is defined | ternary('52:54:00' | community.general.random_mac(seed=item.network_ip), '52:54:00' | community.general.random_mac() | regex_replace('(^|:)0([0-9A-Fa-f])', '\\1\\2')) }}",
+            "network_ip": "{{ item.network_ip | default('') }}",
+            "network_gateway": "{{ item.network_ip is defined | ternary(item.network_ip.split('.')[0:3] | join('.'), '') }}.1",
             "network_ssh_port": "{{ item.network_ssh_port | default(2222) }}",
             "network_ssh_user": "{{ item.network_ssh_user | default('ansible') }}",
 
@@ -94,7 +95,7 @@
       ansible.builtin.assert:
         that:
           - item.image_arch in ['x86_64', 'aarch64']
-          - item.network_mode in ['user', 'vmnet-shared']
+          - item.network_mode in ['user', 'vmnet-shared', 'socket']
           - item.disk_type in ['virtio', 'virtio-scsi']
           - item.bios_type in ['uefi', 'bios']
         fail_msg: "Molecule instance {{ item.name }} configuration is not supported"
@@ -254,16 +255,33 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Create cloud-init iso using mkisofs
-      ansible.builtin.command: >
-        mkisofs
-        -output {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso
-        -volid cidata
-        -joliet
-        -rock
-        {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
+    - name: Create cloud-init iso using hdiutil
+      ansible.builtin.shell:
+        hdiutil makehybrid -o {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso -hfs -joliet -iso -default-volume-name cidata {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
       args:
         creates: "{{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso"
+      loop: "{{ molecule_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    #- name: Create cloud-init iso using mkisofs
+    #  ansible.builtin.command: >
+    #    mkisofs
+    #    -output {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso
+    #    -volid cidata
+    #    -joliet
+    #    -rock
+    #    {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
+    #  args:
+    #    creates: "{{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso"
+    #  loop: "{{ molecule_instances }}"
+    #  loop_control:
+    #    label: "{{ item.name }}"
+
+    - name: Allow access to cloud-init
+      ansible.builtin.file:
+        path: "{{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso"
+        mode: '0644'
       loop: "{{ molecule_instances }}"
       loop_control:
         label: "{{ item.name }}"
@@ -272,16 +290,64 @@
 
     - name: Create VMs disks
       ansible.builtin.command: >
-        qemu-img create
-        -f qcow2
-        -o backing_file={{ images_cache[item.image_url] }},backing_fmt={{ item.image_format }}
-        {{ item.path_disk }}
-        {{ item.vm_disk }}
+        qemu-img create -f qcow2 -o backing_file={{ images_cache[item.image_url] }},backing_fmt={{ item.image_format }} {{ item.path_disk }}
       args:
         creates: "{{ item.path_disk }}"
       loop: "{{ molecule_instances }}"
       loop_control:
         label: "{{ item.name }}"
+
+    - name: Allow access to VMs disks
+      ansible.builtin.file:
+        path: "{{ item.path_disk }}"
+        mode: "0644"
+      loop: "{{ molecule_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Create vm socket
+      when: qemu_network_mode == 'socket'
+      become: true
+      block:
+        - name: Stop existing sockets
+          ignore_errors: true
+          ansible.builtin.shell: |
+            ps -A | grep socket_vmnet | awk '{print $1 " " $4}' | grep socket_vmnet | awk '{print $1}' | xargs kill -9
+          args:
+            creates: "{{ molecule_ephemeral_directory }}/bootptab"
+        - name: Create socket config
+          file:
+            path: /etc/bootptab
+            state: touch
+            mode: 0644
+          register: p
+          changed_when: p.diff.before.state == "absent" or p.diff.before.mode|default("0644") != "0644"
+        - name: Create socket config header
+          lineinfile:
+            dest: /etc/bootptab
+            line: "%%"
+            state: present
+        - name: Create socket config table header
+          lineinfile:
+            dest: /etc/bootptab
+            line: "#  hostname hwtype hwaddr  ipaddr  bootfile"
+            state: present
+        - name: Create socket config table entries
+          lineinfile:
+            dest: /etc/bootptab
+            line: "{{ item.name }}  1 {{ item.network_mac }}  {{ item.network_ip }}"
+            state: present
+          loop: "{{ molecule_instances }}"
+          loop_control:
+            label: "{{ item.name }}"
+        - name: Create socket
+          ignore_errors: true
+          poll: 0
+          async: 65000
+          ansible.builtin.command: /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-gateway={{ molecule_instances[0].network_gateway }} /opt/homebrew/var/run/socket_vmnet
+        - name: Wait for socket to be created
+          ansible.builtin.pause:
+            seconds: 20
 
     - name: Launch VMs as priviliged user
       ansible.builtin.set_fact:
@@ -290,15 +356,16 @@
     - name: Launch VMs
       become: "{{ qemu_privileged }}"
       ansible.builtin.command: >-
+        {% if item.network_mode == 'socket' %}
+          /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client /opt/homebrew/var/run/socket_vmnet 
+        {% endif %}
         qemu-system-{{ item.image_arch }}
         -name {{ item.name }}
         -daemonize
         -pidfile {{ item.path_pid }}
-
         -display none
         -m {{ item.vm_memory }}
         -smp {{ item.vm_cpus }}
-
         -boot d
         -cdrom {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso
         {% if item.disk_type == 'virtio' %}
@@ -308,11 +375,12 @@
           -device virtio-scsi-pci,id=scsi
           -device scsi-hd,drive=hd
         {% endif %}
-
+        {% if item.network_mode == 'socket' %}
+          -device virtio-net-pci,netdev=net0,mac={{ item.network_mac }} -netdev socket,id=net0,fd=3
+        {% endif %}
         {% if item.network_mode == 'vmnet-shared' %}
           -nic vmnet-shared,model=virtio-net-pci,mac={{ item.network_mac }}
         {% endif %}
-
         {% if item.network_mode == 'user' %}
           {% if item.network_extra_args == '' %}
             -nic user,model=virtio-net-pci,hostfwd=tcp::{{ item.network_ssh_port }}-:22
@@ -320,34 +388,38 @@
             -nic user,model=virtio-net-pci,hostfwd=tcp::{{ item.network_ssh_port }}-:22,{{ item.network_extra_args }}
           {% endif %}
         {% endif %}
-
         {% if item.bios_type == 'uefi' %}
           -bios {{ molecule_driver_directory }}/edk2-{{ item.image_arch }}.fd
         {% endif %}
-
         {% if item.image_arch == 'aarch64' %}
           -machine virt
-          {% if item.image_arch == qemu_machine and qemu_cap_hvf %}
+          {% if item.network_mode == 'socket' %}
+            -cpu cortex-a72
+            -accel hvf
+          {% elif item.image_arch == qemu_machine and qemu_cap_hvf %}
             -cpu host
             -accel hvf
           {% else %}
             -cpu cortex-a72
           {% endif %}
         {% endif %}
-
         {% if item.image_arch == 'x86_64' %}
           {% if item.image_arch == qemu_machine and qemu_cap_kvm %}
             -cpu host
             -enable-kvm
           {% endif %}
         {% endif %}
-
         {{ item.vm_extra_args }}
       args:
         creates: "{{ item.path_pid }}"
       loop: "{{ molecule_instances }}"
       loop_control:
         label: "{{ item.name }}"
+
+    - name: Wait for vms to launch (socket)
+      when: qemu_network_mode == 'socket'
+      ansible.builtin.pause:
+        seconds: 30
 
     - name: Allow read access to VMs pid files
       become: "{{ qemu_privileged }}"
@@ -395,6 +467,19 @@
           loop: "{{ molecule_instances_arp.results }}"
           loop_control:
             label: "{{ item.item.name }}"
+
+
+    ### qemu network: socket ############################################
+
+    - name: Configure QEMU network (socket)
+      when: qemu_network_mode == 'socket'
+      block:
+        - name: Create instances IPv4 dict (socket)
+          ansible.builtin.set_fact:
+            molecule_instances_ipv4: "{{ molecule_instances_ipv4 | combine({item.name: item.network_ip}) }}"
+          loop: "{{ molecule_instances }}"
+          loop_control:
+            label: "{{ item.name }}"
 
     ### ssh ###################################################################
 

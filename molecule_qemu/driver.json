@@ -39,7 +39,7 @@
         "network_mode": {
           "title": "Network Mode",
           "type": "string",
-          "enum": ["vmnet-shared", "user"]
+          "enum": ["vmnet-shared", "user", "socket"]
         },
         "network_ssh_port": {
           "title": "Network SSH Port",
@@ -47,6 +47,10 @@
         },
         "network_ssh_user": {
           "title": "Network SSH User",
+          "type": "string"
+        },
+        "network_ip": {
+          "title": "Network ip",
           "type": "string"
         },
         "vm_extra_args": {
