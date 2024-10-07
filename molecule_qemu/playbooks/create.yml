@@ -255,28 +255,28 @@
       loop_control:
         label: "{{ item.name }}"
 
-    - name: Create cloud-init iso using hdiutil
-      ansible.builtin.shell:
-        hdiutil makehybrid -o {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso -hfs -joliet -iso -default-volume-name cidata {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
-      args:
-        creates: "{{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso"
-      loop: "{{ molecule_instances }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-    #- name: Create cloud-init iso using mkisofs
-    #  ansible.builtin.command: >
-    #    mkisofs
-    #    -output {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso
-    #    -volid cidata
-    #    -joliet
-    #    -rock
-    #    {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
+    #- name: Create cloud-init iso using hdiutil
+    #  ansible.builtin.shell:
+    #    hdiutil makehybrid -o {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso -hfs -joliet -iso -default-volume-name cidata {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
     #  args:
     #    creates: "{{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso"
     #  loop: "{{ molecule_instances }}"
     #  loop_control:
     #    label: "{{ item.name }}"
+
+    - name: Create cloud-init iso using mkisofs
+      ansible.builtin.command: >
+        mkisofs
+        -output {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso
+        -volid cidata
+        -joliet
+        -rock
+        {{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}/
+      args:
+        creates: "{{ molecule_ephemeral_directory }}/run/cloud-init/{{ item.name }}.iso"
+      loop: "{{ molecule_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     - name: Allow access to cloud-init
       ansible.builtin.file:
@@ -347,7 +347,7 @@
           ansible.builtin.command: /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet --vmnet-gateway={{ molecule_instances[0].network_gateway }} /opt/homebrew/var/run/socket_vmnet
         - name: Wait for socket to be created
           ansible.builtin.pause:
-            seconds: 20
+            seconds: 30
 
     - name: Launch VMs as priviliged user
       ansible.builtin.set_fact:
@@ -363,7 +363,8 @@
         -name {{ item.name }}
         -daemonize
         -pidfile {{ item.path_pid }}
-        -display none
+        -display vnc=127.0.0.1:{{ loop_index}}
+        -device virtio-gpu-pci -device virtio-mouse-pci -device virtio-keyboard-pci -device qemu-xhci -device usb-kbd -device usb-tablet
         -m {{ item.vm_memory }}
         -smp {{ item.vm_cpus }}
         -boot d
@@ -414,7 +415,9 @@
         creates: "{{ item.path_pid }}"
       loop: "{{ molecule_instances }}"
       loop_control:
+        pause: 5
         label: "{{ item.name }}"
+        index_var: loop_index
 
     - name: Wait for vms to launch (socket)
       when: qemu_network_mode == 'socket'
